@@ -1,6 +1,7 @@
 # HEpredictGENE
 Using HE slide of prostate cancer to predict gene expression
 
+![model_structure](model_structure.png)
 
 1. download HE slide from TCGA and RNAseq(log2(FPKM+1)) from XENA
 2. create_patches_fp.py
