@@ -32,7 +32,7 @@ Tensorboard==2.19.0,
 TensorboardX==2.6.2.2
 
 ## Installation Guide for Linux (using anaconda)
-1. Clone this git repository: `git clone https://github.com/anxuanhan/ProGENIE.git`
+1. Clone this git repository: `git clone https://github.com/ABILiLab/ProGENIE.git`
 2. `cd ProGENIE`
 3. Create a conda environment: `conda create -n progenie python=3.10.0`
 4. `conda activate progenie`
