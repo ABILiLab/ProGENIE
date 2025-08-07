@@ -90,7 +90,7 @@ To combine the k-Means features with ground truth gene expression profiles for m
 
 An example script to run the dataset preparation: `scripts/prepare_dataset.sh`
 
-**2. inference and evaluation**
+**2. Inference and evaluation**
 
 To perform model inference on the test set and evaluate performance:
 
