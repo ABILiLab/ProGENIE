@@ -1,4 +1,4 @@
-# 🧚🏻‍♀️ProGENIE: Predicting Gene Expression from Whole Slide Images in Prostate Cancer using Deep Learning
+# 🧚🏻‍♀️ProGENIE: Predicting gene expression from whole slide images in prostate cancer using deep learning
 
 ### Abstract
 
