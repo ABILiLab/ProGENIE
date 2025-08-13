@@ -77,8 +77,7 @@ def compute_genewise_pcc(df_true: pd.DataFrame, df_pred: pd.DataFrame):
     print("📊 Gene-wise PCC Summary:")
     print(f"Mean PCC   : {gene_df['pcc'].mean():.4f}")
     print(f"Median PCC : {gene_df['pcc'].median():.4f}")
-    print(f"Max PCC    : {gene_df['pcc'].max():.4f}")
-    print(f"Min PCC    : {gene_df['pcc'].min():.4f}")
+
 
     return gene_df
 
