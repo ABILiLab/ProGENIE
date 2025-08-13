@@ -6,7 +6,7 @@
 
 ### Overview
 <p align="center">
-  <img src="https://github.com/anxuanhan/ProGENIE/blob/main/pics/model_architecture.png" alt="model architecture" width="600"/>
+  <img src="https://github.com/ABILiLab/ProGENIE/blob/main/pics/model_architecture.png" alt="model architecture" width="600"/>
 </p>
 
 ## Pre-requisites
