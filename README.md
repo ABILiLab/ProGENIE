@@ -81,7 +81,7 @@ TensorboardX==2.6.2.2
 
   An example script to run the k-Means clustering: `scripts/kmean_features.sh`
 
-## Inferrence on independent dataset
+## Inference on independent dataset
 We released the model weights for four pre-trained models on [HuggingFace](https://huggingface.co/ananananxuan/ProGENIE/tree/main "HuggingFace"), please download the weights first.
 
 **1. Prepare the dataset**
@@ -109,8 +109,9 @@ This includes:
 - test_gene_metrics.csv: PCC, RMSE, and R²
 
 
+## Reference
 
-
+Please cite our publication: Han _et al_., "Predicting gene expression from whole slide images in prostate cancer using deep learning". doi: xxx.
 
 
 
