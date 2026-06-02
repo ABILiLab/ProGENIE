@@ -117,12 +117,12 @@ An example script to run the visualization:
 python visualization.py \
   --base_dir heatmap \
   --count_file filtered_feature_bc_matrix.h5 \
-  --h5_path heatmap/features/wsi_features.h5 \
-  --model_path heatmap/checkpoints/model_best.pth \
-  --gene_names_pt heatmap/data/dataset.pt \
+  --h5_path features/wsi_features.h5 \
+  --model_path checkpoints/model_best.pth \
+  --gene_names_pt data/dataset.pt \
   --genes_csv data/common_genes.csv \
-  --out_dir heatmaps/results \
-  --offsets_json heatmaps/wsi_crop.json \
+  --out_dir results \
+  --offsets_json wsi_crop.json \
   --gene ACTA2
 ```
 **Note:** `--gene_names_pt` should be the training dataset (`dataset.pt`), which stores the gene ordering used during model training.
