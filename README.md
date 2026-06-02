@@ -109,8 +109,19 @@ This includes:
 - test_gene_metrics.csv: PCC, RMSE, and R²
 
 ## Visualization on spatial 
+Generate spatial gene expression heatmaps from spatial transcriptomics slides using a sliding-window inference strategy. Predicted expression values are assigned to the center patch of each window, and optional Gaussian smoothing can be applied to both ground-truth and predicted expression maps for visualization.
 
-  
+An example script to run the visualization:
+```
+python visualization.py \
+  --base_dir spatial \
+  --count_file filtered_feature_bc_matrix.h5 \
+  --h5_path wsi_features.h5 \
+  --model_path model_best.pth \
+  --out_dir heatmap \
+  --offsets_json wsi_crop.json \
+  --gene ACTA2
+```
 
 
 ## Reference
