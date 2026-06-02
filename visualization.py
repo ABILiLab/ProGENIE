@@ -1,26 +1,24 @@
 import argparse
 import json
 import os
-import pickle
-import sys
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import h5py
 import numpy as np
 import pandas as pd
 import scanpy as sc
 import torch
+import torch.nn as nn
+from einops import rearrange
 from scipy.spatial import cKDTree
 from scipy.stats import pearsonr, wasserstein_distance
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib.patches import Circle
+from matplotlib.collections import PatchCollection
 
 
-def ensure_sequoia_on_path(sequoia_root: Optional[str]) -> None:
-    if sequoia_root:
-        if sequoia_root not in sys.path:
-            sys.path.insert(0, sequoia_root)
-
-
-def load_h5(path: str):
+def load_h5_features(path: str):
     with h5py.File(path, "r") as f:
         fk = None
         ck = None
@@ -49,6 +47,104 @@ def load_h5(path: str):
             if fk and ck:
                 return grp[fk][:], grp[ck][:], dict(f.attrs)
     raise ValueError(f"Could not find features/coords in {path}")
+
+
+class FeatureHead(nn.Module):
+    def __init__(self, input_dim=1024, hidden_dim=512):
+        super().__init__()
+        self.linear1 = nn.Linear(input_dim, hidden_dim)
+        self.linear2 = nn.Linear(input_dim, hidden_dim)
+
+    def forward(self, x):
+        tanh_out = torch.tanh(self.linear1(x))
+        sigmoid_out = torch.sigmoid(self.linear2(x))
+        return torch.cat([tanh_out, sigmoid_out], dim=-1)
+
+
+class AttentionPooling(nn.Module):
+    def __init__(self, input_dim=1024):
+        super().__init__()
+        self.attn = nn.Linear(input_dim, 1)
+
+    def forward(self, x, return_weights=False):
+        scores = self.attn(x)
+        weights = torch.softmax(scores, dim=1)
+        pooled = torch.sum(x * weights, dim=1)
+        if return_weights:
+            return pooled, weights
+        return pooled
+
+
+class GeneExpressionModelHead(nn.Module):
+    def __init__(
+        self,
+        input_dim=1024,
+        hidden_dim=512,
+        output_dim=16059,
+        num_heads=6,
+        num_tokens=100,
+    ):
+        super().__init__()
+        # Keep architecture identical to training-time final/model.py
+        self.pos_emb1D = nn.Parameter(torch.randn(num_tokens, input_dim))
+        self.num_heads = num_heads
+        self.feature_heads = nn.ModuleList(
+            [FeatureHead(input_dim, hidden_dim) for _ in range(num_heads)]
+        )
+        self.attn_pooling_heads = nn.ModuleList(
+            [AttentionPooling(input_dim) for _ in range(num_heads)]
+        )
+        self.proj = nn.Linear(num_heads * input_dim, input_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim * num_heads, 2048),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(2048, output_dim),
+        )
+
+    def forward(self, x):
+        # x: [B, N, D], N expected to match num_tokens (e.g., 10x10=100)
+        if x.size(1) != self.pos_emb1D.size(0):
+            raise ValueError(
+                f"Input token length {x.size(1)} != pos_emb tokens {self.pos_emb1D.size(0)}"
+            )
+        x = x + self.pos_emb1D.to(x.device).unsqueeze(0)
+
+        pooled_list = []
+        for head, attn in zip(self.feature_heads, self.attn_pooling_heads):
+            features = head(x)
+            pooled = attn(features)
+            pooled_list.append(pooled)
+        pooled_cat = torch.cat(pooled_list, dim=1)
+        return self.mlp(pooled_cat)
+
+
+def load_gene_names_from_pt(path: str) -> List[str]:
+    obj = torch.load(path, map_location="cpu")
+    if isinstance(obj, dict) and "gene_names" in obj:
+        return list(obj["gene_names"])
+    raise ValueError(f"Cannot find 'gene_names' in {path}")
+
+
+def load_genes_csv(path: str) -> List[str]:
+    df = pd.read_csv(path)
+    if "gene" in df.columns:
+        return df["gene"].dropna().astype(str).tolist()
+    return df.iloc[:, 0].dropna().astype(str).tolist()
+
+
+def load_visium_adata(base_dir: str, count_file: str):
+    adata = sc.read_visium(
+        path=base_dir,
+        count_file=count_file,
+        source_image_path=os.path.join(base_dir, "spatial"),
+        load_images=False,
+    )
+    adata.var_names_make_unique()
+    sc.pp.filter_genes(adata, min_cells=3)
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+    return adata
 
 
 def load_positions_csv(base_dir: str) -> Optional[str]:
@@ -94,137 +190,90 @@ def coords_from_positions_csv(path: str, barcodes: List[str]) -> np.ndarray:
     return coords
 
 
-def load_gene_list(genes_pkl: Optional[str], gene_list_path: Optional[str]) -> List[str]:
-    genes = None
-    if genes_pkl:
-        with open(genes_pkl, "rb") as f:
-            obj = pickle.load(f)
-        if isinstance(obj, dict) and "genes" in obj:
-            genes = obj["genes"]
-        elif isinstance(obj, list) and obj:
-            if isinstance(obj[0], dict) and "genes" in obj[0]:
-                genes = obj[0]["genes"]
-            elif isinstance(obj[-1], dict) and "genes" in obj[-1]:
-                genes = obj[-1]["genes"]
-
-    if genes is None and gene_list_path:
-        if gene_list_path.endswith(".npy"):
-            genes = np.load(gene_list_path, allow_pickle=True)
-        else:
-            df = pd.read_csv(gene_list_path)
-            if "gene" in df.columns:
-                genes = df["gene"].tolist()
-            else:
-                genes = df.iloc[:, 0].tolist()
-
-    if genes is None:
-        raise ValueError("Could not infer gene list; provide --gene_list or --genes_pkl")
-    return list(genes)
+def resolve_patch_centers(coords: np.ndarray, attrs: Dict, patch_size_arg: int):
+    patch_size = int(attrs.get("patch_size", patch_size_arg))
+    coord_type = attrs.get("coord_type", "center")
+    if isinstance(coord_type, bytes):
+        coord_type = coord_type.decode("utf-8", errors="ignore")
+    centers = coords.astype(float).copy()
+    if coord_type == "top_left":
+        half = patch_size / 2.0
+        centers[:, 0] += half
+        centers[:, 1] += half
+    return centers, patch_size
 
 
-def load_genes_csv(path: str) -> List[str]:
-    df = pd.read_csv(path)
-    if "gene" in df.columns:
-        return df["gene"].dropna().astype(str).tolist()
-    return df.iloc[:, 0].dropna().astype(str).tolist()
+def infer_grid_step(patch_centers: np.ndarray) -> float:
+    tree = cKDTree(patch_centers)
+    dists, _ = tree.query(patch_centers, k=2)
+    step = float(np.median(dists[:, 1]))
+    if not np.isfinite(step) or step <= 0:
+        raise ValueError("Failed to infer grid step from patch centers.")
+    return step
 
 
-def strip_state_dict_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    if any(k.startswith("module.") for k in state_dict.keys()):
-        state_dict = {k[len("module."):]: v for k, v in state_dict.items()}
-    if any(k.startswith("model.") for k in state_dict.keys()):
-        state_dict = {k[len("model."):]: v for k, v in state_dict.items()}
-    return state_dict
+def build_grid_index(patch_centers: np.ndarray, step: float):
+    min_x = float(np.min(patch_centers[:, 0]))
+    min_y = float(np.min(patch_centers[:, 1]))
+    gx = np.rint((patch_centers[:, 0] - min_x) / step).astype(int)
+    gy = np.rint((patch_centers[:, 1] - min_y) / step).astype(int)
+    grid_to_idx = {(int(x), int(y)): i for i, (x, y) in enumerate(zip(gx, gy))}
+    return gx, gy, grid_to_idx
 
 
-def load_checkpoint_state(model_path: str, device: str) -> Dict[str, torch.Tensor]:
-    if model_path.endswith(".safetensors"):
-        try:
-            from safetensors.torch import load_file
-        except Exception as exc:
-            raise RuntimeError("safetensors is required to load .safetensors files") from exc
-        state = load_file(model_path)
-    else:
-        state = torch.load(model_path, map_location=device)
-        if isinstance(state, dict) and "state_dict" in state:
-            state = state["state_dict"]
-    return strip_state_dict_prefix(state)
+def make_sliding_windows(
+    feats: np.ndarray,
+    gx: np.ndarray,
+    gy: np.ndarray,
+    grid_to_idx: Dict[Tuple[int, int], int],
+    window_size: int = 10,
+):
+    half_left = window_size // 2
+    half_right = window_size - half_left - 1
+    center_indices = []
+    window_indices = []
 
-
-def infer_model_dims(state_dict: Dict[str, torch.Tensor]):
-    input_dim = None
-    num_outputs = None
-
-    for key, value in state_dict.items():
-        if key.endswith("linear_head.1.weight"):
-            num_outputs = value.shape[0]
-            input_dim = value.shape[1]
-            break
-
-    if input_dim is None:
-        for key, value in state_dict.items():
-            if key.endswith("linear_head.0.weight"):
-                input_dim = value.shape[0]
+    for center_idx, (cx, cy) in enumerate(zip(gx, gy)):
+        idxs = []
+        complete = True
+        for yy in range(cy - half_left, cy + half_right + 1):
+            for xx in range(cx - half_left, cx + half_right + 1):
+                j = grid_to_idx.get((xx, yy))
+                if j is None:
+                    complete = False
+                    break
+                idxs.append(j)
+            if not complete:
                 break
+        if complete and len(idxs) == window_size * window_size:
+            center_indices.append(center_idx)
+            window_indices.append(idxs)
 
-    if input_dim is None:
-        for key, value in state_dict.items():
-            if key.endswith("pos_emb1D"):
-                input_dim = value.shape[1]
-                break
+    if not window_indices:
+        raise ValueError("No complete sliding windows found. Check grid/step/window_size.")
 
-    return input_dim, num_outputs
+    window_feats = feats[np.array(window_indices, dtype=int)]
+    return np.array(center_indices, dtype=int), window_feats
 
 
-def load_model(model_path: str, model_type: str, device: str, num_clusters: int):
-    state = load_checkpoint_state(model_path, device)
-    input_dim, num_outputs = infer_model_dims(state)
-    if input_dim is None or num_outputs is None:
-        raise ValueError("Could not infer model dimensions from checkpoint")
-
-    if model_type == "vis":
-        from src.tformer_lin import ViS
-
-        model = ViS(
-            num_outputs=num_outputs,
-            input_dim=input_dim,
-            depth=6,
-            nheads=16,
-            dimensions_f=64,
-            dimensions_c=64,
-            dimensions_s=64,
-            num_clusters=num_clusters,
-            device=str(device),
-        )
-    elif model_type == "vit":
-        from src.vit import ViT
-
-        model = ViT(
-            num_outputs=num_outputs,
-            dim=input_dim,
-            depth=6,
-            heads=16,
-            mlp_dim=2048,
-            dim_head=64,
-            num_clusters=num_clusters,
-            device=str(device),
-        )
-    else:
-        raise ValueError("model_type must be 'vis' or 'vit'")
-
-    model_state = model.state_dict()
-    filtered_state = {}
-    for key, value in state.items():
-        if key in model_state and model_state[key].shape == value.shape:
-            filtered_state[key] = value
-    model.load_state_dict(filtered_state, strict=False)
-    model.to(device)
+def predict_window_centers(
+    model: nn.Module,
+    window_feats: np.ndarray,
+    device: str,
+    batch_size: int = 128,
+) -> np.ndarray:
     model.eval()
+    outputs = []
+    with torch.no_grad():
+        for start in range(0, window_feats.shape[0], batch_size):
+            batch = window_feats[start : start + batch_size]
+            bt = torch.from_numpy(batch).float().to(device)
+            pred = model(bt).cpu().numpy()
+            outputs.append(pred)
+    return np.concatenate(outputs, axis=0)
 
-    return model, input_dim, num_outputs
 
-
-def smooth_expression_by_neighbors(coords: np.ndarray, values: np.ndarray, k=6, sigma=1.0):
+def smooth_expression_by_neighbors(coords: np.ndarray, values: np.ndarray, k=6, sigma=1.2):
     tree = cKDTree(coords)
     dists, idxs = tree.query(coords, k=k + 1)
     median_nn = np.median(dists[:, 1])
@@ -259,6 +308,7 @@ def map_patch_preds_to_spots(
         sigma = median_nn if median_nn > 0 else 1.0
         weights = np.exp(-0.5 * (dists / sigma) ** 2)
 
+    # patch_preds: [n_patch, n_gene] -> mapped: [n_spot, n_gene]
     mapped = np.sum(patch_preds[idxs] * weights[:, :, None], axis=1) / np.sum(
         weights[:, :, None], axis=1
     )
@@ -266,218 +316,215 @@ def map_patch_preds_to_spots(
     return mapped, nearest
 
 
-def calc_metrics(pred: np.ndarray, true: np.ndarray):
+def calc_pcc_emd(pred: np.ndarray, true: np.ndarray):
     mask = np.isfinite(pred) & np.isfinite(true)
     if mask.sum() < 3:
-        return np.nan, np.nan, np.nan
-    pred = pred[mask]
-    true = true[mask]
-    pcc = pearsonr(pred, true)[0]
-    mse = float(np.mean((pred - true) ** 2))
-    p = (pred - pred.min()) / (pred.max() - pred.min() + 1e-8)
-    t = (true - true.min()) / (true.max() - true.min() + 1e-8)
+        return np.nan, np.nan
+    pcc = pearsonr(pred[mask], true[mask])[0]
+    p = pred[mask]
+    t = true[mask]
+    p = (p - p.min()) / (p.max() - p.min() + 1e-8)
+    t = (t - t.min()) / (t.max() - t.min() + 1e-8)
     emd = wasserstein_distance(p, t)
-    return float(pcc), float(emd), float(mse)
+    return float(pcc), float(emd)
 
 
-def compute_patch_predictions_sliding(
-    feats: np.ndarray,
-    coords: np.ndarray,
-    gene_indices: List[int],
-    model_path: str,
-    model_type: str,
-    device: str,
-    patch_size: int,
-    coord_type: str,
-    window_size: int,
-    stride: int,
-    min_coverage: float,
-):
-    num_tiles = feats.shape[0]
-    feat_dim = feats.shape[1]
+def normalize_pair(a: np.ndarray, b: np.ndarray, vmin_pct=5.0, vmax_pct=95.0):
+    combined = np.concatenate([a, b])
+    vmin = np.percentile(combined, vmin_pct)
+    vmax = np.percentile(combined, vmax_pct)
+    return np.clip(a, vmin, vmax), np.clip(b, vmin, vmax), float(vmin), float(vmax)
 
-    model, input_dim, num_outputs = load_model(
-        model_path, model_type, device, num_clusters=window_size * window_size
+
+def quantile_match(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    if len(source) == 0:
+        return source
+    order = np.argsort(source)
+    ranks = np.empty_like(order, dtype=np.float64)
+    ranks[order] = np.linspace(0.0, 1.0, num=len(source), endpoint=True)
+    target_sorted = np.sort(target)
+    return np.interp(
+        ranks,
+        np.linspace(0.0, 1.0, num=len(target_sorted), endpoint=True),
+        target_sorted,
     )
 
-    if feat_dim != input_dim:
-        raise ValueError(
-            f"Feature dim {feat_dim} does not match model input dim {input_dim}"
-        )
 
-    patch_centers = coords.astype(float).copy()
-    if coord_type == "top_left":
-        half = patch_size / 2.0
-        patch_centers[:, 0] = patch_centers[:, 0] + half
-        patch_centers[:, 1] = patch_centers[:, 1] + half
+def plot_spots(coords, values, vmin, vmax, cmap, spot_size_scale, ax, title):
+    x = coords[:, 0]
+    y = coords[:, 1]
+    tree = cKDTree(np.column_stack([x, y]))
+    dists, _ = tree.query(np.column_stack([x, y]), k=2)
+    median_nn = np.median(dists[:, 1])
+    radius = median_nn * spot_size_scale
 
-    min_x = patch_centers[:, 0].min()
-    min_y = patch_centers[:, 1].min()
-    x_tf = np.rint((patch_centers[:, 0] - min_x) / patch_size).astype(int)
-    y_tf = np.rint((patch_centers[:, 1] - min_y) / patch_size).astype(int)
+    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    cmap_obj = plt.get_cmap(cmap)
+    colors = cmap_obj(norm(values))
 
-    max_x = int(x_tf.max())
-    max_y = int(y_tf.max())
-
-    pred_sum = np.zeros((num_tiles, len(gene_indices)), dtype=np.float64)
-    pred_count = np.zeros(num_tiles, dtype=np.int32)
-
-    coords_tf = np.column_stack([x_tf, y_tf])
-
-    for x in range(0, max_x + 1, stride):
-        for y in range(0, max_y + 1, stride):
-            in_window = (
-                (coords_tf[:, 0] >= x)
-                & (coords_tf[:, 0] < x + window_size)
-                & (coords_tf[:, 1] >= y)
-                & (coords_tf[:, 1] < y + window_size)
-            )
-            idxs = np.where(in_window)[0]
-            if len(idxs) < int(window_size * window_size * min_coverage):
-                continue
-
-            xy = coords_tf[idxs]
-            order = np.lexsort((xy[:, 0], xy[:, 1]))
-            idxs = idxs[order]
-
-            features_all = feats[idxs]
-            target_tokens = window_size * window_size
-            if features_all.shape[0] > target_tokens:
-                features_all = features_all[:target_tokens]
-            elif features_all.shape[0] < target_tokens:
-                pad = np.zeros((target_tokens - features_all.shape[0], feat_dim))
-                features_all = np.concatenate([features_all, pad], axis=0)
-
-            with torch.no_grad():
-                x_t = torch.tensor(features_all).float().unsqueeze(0).to(device)
-                preds = model(x_t).detach().cpu().numpy()[0]
-                pred_vals = preds[gene_indices]
-
-            pred_sum[idxs] += pred_vals
-            pred_count[idxs] += 1
-
-    pred_vals = np.full((num_tiles, len(gene_indices)), np.nan, dtype=np.float64)
-    mask = pred_count > 0
-    pred_vals[mask] = pred_sum[mask] / pred_count[mask, None]
-    return pred_vals, patch_centers
+    patches = [Circle((xi, yi), radius=radius) for xi, yi in zip(x, y)]
+    col = PatchCollection(patches, facecolors=colors, edgecolors="none", linewidths=0, zorder=2)
+    ax.add_collection(col)
+    margin = median_nn
+    ax.set_xlim(x.min() - margin, x.max() + margin)
+    ax.set_ylim(y.max() + margin, y.min() - margin)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.set_title(title, fontsize=12)
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Sliding-window SEQUOIA metrics for a list of genes."
-    )
-    parser.add_argument("--base_dir", required=True, help="Visium base directory")
-    parser.add_argument("--count_file", required=True, help="Visium count file name")
+def try_compute_svg_top100(adata):
+    try:
+        import squidpy as sq  # optional
+    except Exception:
+        return None, "squidpy not installed; skip SVG selection"
+
+    ad = adata.copy()
+    if "spatial" not in ad.obsm:
+        return None, "adata.obsm['spatial'] missing; skip SVG selection"
+
+    sq.gr.spatial_neighbors(ad, coord_type="generic")
+    sq.gr.spatial_autocorr(ad, mode="moran", genes=ad.var_names)
+
+    moran = ad.uns["moranI"].copy()
+    # Compatible with different squidpy versions
+    p_col = None
+    for c in ["pval_norm_fdr_bh", "pval_norm", "pval"]:
+        if c in moran.columns:
+            p_col = c
+            break
+    if p_col is None:
+        return None, "No Moran's I p-value column found; skip SVG selection"
+
+    sig = moran[moran[p_col] < 0.05].sort_values("I", ascending=False)
+    top100 = sig.head(100).index.tolist()
+    return top100, f"SVG selected by {p_col}"
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base_dir", required=True)
+    parser.add_argument("--count_file", required=True)
+    parser.add_argument("--h5_path", required=True)
+    parser.add_argument("--model_path", required=True)
+    parser.add_argument("--gene_names_pt", required=True)
     parser.add_argument("--genes_csv", required=True, help="CSV with genes to evaluate")
-    parser.add_argument("--h5_path", required=True, help="H5 with patch features and coords")
-    parser.add_argument("--model_type", choices=["vis", "vit"], default="vis")
-    parser.add_argument("--model_path", required=True, help="Model checkpoint path")
-    parser.add_argument("--genes_pkl", default=None, help="Optional model gene list pickle")
-    parser.add_argument("--gene_list", default=None, help="Model gene list csv/npy")
-    parser.add_argument("--out_dir", required=True, help="Output directory")
-    parser.add_argument("--offsets_json", default=None, help="Crop offsets json")
+    parser.add_argument("--out_dir", required=True)
+    parser.add_argument("--offsets_json", default=None)
     parser.add_argument("--patch_size", type=int, default=384)
     parser.add_argument("--window_size", type=int, default=10)
-    parser.add_argument("--stride", type=int, default=1)
-    parser.add_argument("--min_coverage", type=float, default=0.5)
+    parser.add_argument("--window_batch_size", type=int, default=128)
     parser.add_argument("--k_neigh", type=int, default=3)
     parser.add_argument("--weight_mode", choices=["uniform", "gaussian"], default="gaussian")
     parser.add_argument("--smooth_st", action="store_true")
     parser.add_argument("--smooth_pred", action="store_true")
     parser.add_argument("--smooth_k", type=int, default=6)
     parser.add_argument("--smooth_sigma", type=float, default=1.2)
-    return parser
-
-
-def main() -> None:
-    parser = build_arg_parser()
+    parser.add_argument("--sequoia_pred_csv", default=None)
+    parser.add_argument("--gene", default=None, help="Optional single gene for map visualization.")
+    parser.add_argument("--cmap", default="coolwarm")
+    parser.add_argument("--spot_size_scale", type=float, default=0.45)
+    parser.add_argument("--vmin_pct", type=float, default=5.0)
+    parser.add_argument("--vmax_pct", type=float, default=95.0)
+    parser.add_argument(
+        "--color_mode",
+        choices=["shared", "true_range", "quantile_match"],
+        default="shared",
+        help="Color normalization mode for single-gene visualization.",
+    )
     args = parser.parse_args()
 
-    ensure_sequoia_on_path(os.environ.get("SEQUOIA_ROOT"))
-
     os.makedirs(args.out_dir, exist_ok=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    adata = sc.read_visium(
-        path=args.base_dir,
-        count_file=args.count_file,
-        source_image_path=os.path.join(args.base_dir, "spatial"),
-        load_images=False,
-    )
-    adata.var_names_make_unique()
-    sc.pp.filter_genes(adata, min_cells=3)
-    sc.pp.normalize_total(adata, target_sum=1e4)
-    sc.pp.log1p(adata)
-
+    print("[INFO] Loading Visium and preprocessing with Scanpy")
+    adata = load_visium_adata(args.base_dir, args.count_file)
     if "spatial" in adata.obsm:
         spot_coords_full = adata.obsm["spatial"].astype(float)
     else:
         pos_path = load_positions_csv(args.base_dir)
         if pos_path is None:
-            raise ValueError("Cannot find tissue_positions_list.csv or tissue_positions.csv")
+            raise ValueError(
+                "adata.obsm['spatial'] missing and no tissue_positions_list.csv found."
+            )
         print(f"[WARN] adata.obsm['spatial'] missing, loading coords from {pos_path}")
-        spot_coords_full = coords_from_positions_csv(pos_path, adata.obs_names)
-
+        spot_coords_full = coords_from_positions_csv(pos_path, list(adata.obs_names))
     true_mat = adata.X.toarray() if hasattr(adata.X, "toarray") else np.asarray(adata.X)
     st_gene_names = list(adata.var_names)
 
-    feats, coords, attrs = load_h5(args.h5_path)
+    print("[INFO] Loading patch features")
+    feats, coords, attrs = load_h5_features(args.h5_path)
+    patch_centers, patch_size = resolve_patch_centers(coords, attrs, args.patch_size)
+    print(f"[INFO] patch_size={patch_size}, n_patch={len(patch_centers)}")
 
-    patch_size = int(attrs.get("patch_size", args.patch_size))
     row_offset = int(attrs.get("row_offset", 0))
     col_offset = int(attrs.get("col_offset", 0))
-
     if args.offsets_json:
         with open(args.offsets_json, "r", encoding="utf-8") as f:
             meta = json.load(f)
         row_offset = int(meta.get("row_offset", meta.get("min_y", row_offset)))
         col_offset = int(meta.get("col_offset", meta.get("min_x", col_offset)))
+    print(f"[INFO] row_offset={row_offset}, col_offset={col_offset}")
 
-    coord_type = attrs.get("coord_type", None)
-    if isinstance(coord_type, bytes):
-        coord_type = coord_type.decode("utf-8", errors="ignore")
-    if coord_type is None:
-        coord_type = "center" if (row_offset != 0 or col_offset != 0) else "top_left"
-
-    genes_model = load_gene_list(args.genes_pkl, args.gene_list)
-    genes_target = load_genes_csv(args.genes_csv)
-
-    st_gene_to_idx = {g: i for i, g in enumerate(st_gene_names)}
-    model_gene_to_idx = {g: i for i, g in enumerate(genes_model)}
-
-    common_genes = [g for g in genes_target if g in st_gene_to_idx and g in model_gene_to_idx]
-    if not common_genes:
-        raise ValueError("No overlap between genes_csv, model genes, and ST genes")
-
-    gene_indices = [model_gene_to_idx[g] for g in common_genes]
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    pred_patch_vals, patch_centers = compute_patch_predictions_sliding(
-        feats=feats,
-        coords=coords,
-        gene_indices=gene_indices,
-        model_path=args.model_path,
-        model_type=args.model_type,
-        device=device,
-        patch_size=patch_size,
-        coord_type=coord_type,
-        window_size=args.window_size,
-        stride=args.stride,
-        min_coverage=args.min_coverage,
+    print("[INFO] Building sliding windows (stride=1)")
+    step = infer_grid_step(patch_centers)
+    gx, gy, grid_to_idx = build_grid_index(patch_centers, step)
+    center_idx, window_feats = make_sliding_windows(
+        feats, gx, gy, grid_to_idx, window_size=args.window_size
+    )
+    print(
+        f"[INFO] grid_step~{step:.3f} px, complete_windows={len(center_idx)}, "
+        f"window_shape={window_feats.shape}"
     )
 
+    gene_names = load_gene_names_from_pt(args.gene_names_pt)
+    model = GeneExpressionModelHead(
+        input_dim=feats.shape[1],
+        hidden_dim=512,
+        output_dim=len(gene_names),
+        num_heads=6,
+        num_tokens=args.window_size * args.window_size,
+    )
+    model.load_state_dict(torch.load(args.model_path, map_location=device))
+    model.to(device)
+
+    print("[INFO] Predicting center-patch transcriptome from 10x10 windows")
+    center_preds = predict_window_centers(
+        model, window_feats, device=device, batch_size=args.window_batch_size
+    )  # [n_center, n_gene]
+
+    center_coords = patch_centers[center_idx]
+    np.save(os.path.join(args.out_dir, "center_patch_coords.npy"), center_coords)
+    np.save(os.path.join(args.out_dir, "center_patch_preds.npy"), center_preds)
+    pd.Series(gene_names, name="gene").to_csv(
+        os.path.join(args.out_dir, "pred_gene_names.csv"), index=False
+    )
+
+    print("[INFO] Mapping patch-center predictions to spot level (kNN + Gaussian)")
     pred_spot_mat, nn_d0 = map_patch_preds_to_spots(
-        patch_centers=patch_centers,
-        patch_preds=pred_patch_vals,
+        patch_centers=center_coords,
+        patch_preds=center_preds,
         spot_coords_full=spot_coords_full,
         row_offset=row_offset,
         col_offset=col_offset,
         k_neigh=args.k_neigh,
         weight_mode=args.weight_mode,
     )
+    print(
+        "[DEBUG] spot->nearest-center distance (px): median=%.2f, p95=%.2f, max=%.2f"
+        % (float(np.median(nn_d0)), float(np.percentile(nn_d0, 95)), float(np.max(nn_d0)))
+    )
 
+    # Align genes between prediction and ST
+    st_gene_to_idx = {g: i for i, g in enumerate(st_gene_names)}
+    target_genes = load_genes_csv(args.genes_csv)
+    target_set = set(target_genes)
+    common_genes = [g for g in gene_names if g in st_gene_to_idx and g in target_set]
+    pred_idx = [gene_names.index(g) for g in common_genes]
     true_idx = [st_gene_to_idx[g] for g in common_genes]
+
+    pred_eval = pred_spot_mat[:, pred_idx].copy()
     true_eval = true_mat[:, true_idx].copy()
-    pred_eval = pred_spot_mat.copy()
 
     if args.smooth_pred:
         for j in range(pred_eval.shape[1]):
@@ -492,32 +539,158 @@ def main() -> None:
 
     rows = []
     for j, g in enumerate(common_genes):
-        pcc, emd, mse = calc_metrics(pred_eval[:, j], true_eval[:, j])
-        rows.append({"gene": g, "pcc": pcc, "emd": emd, "mse": mse})
-
+        pcc, emd = calc_pcc_emd(pred_eval[:, j], true_eval[:, j])
+        rows.append({"gene": g, "pcc": pcc, "emd": emd})
     metrics_df = pd.DataFrame(rows)
-    metrics_path = os.path.join(args.out_dir, "spot_level_metrics_all_common_genes.csv")
-    metrics_df.to_csv(metrics_path, index=False)
+    metrics_df.to_csv(os.path.join(args.out_dir, "spot_level_metrics_all_common_genes.csv"), index=False)
+
+    # Optional SVG top100 subset
+    top100_svg, svg_note = try_compute_svg_top100(adata)
+    with open(os.path.join(args.out_dir, "svg_note.txt"), "w", encoding="utf-8") as f:
+        f.write(svg_note + "\n")
+    if top100_svg is not None:
+        top100_overlap = [g for g in top100_svg if g in set(common_genes)]
+        metrics_top100 = metrics_df[metrics_df["gene"].isin(top100_overlap)].copy()
+        metrics_top100.to_csv(
+            os.path.join(args.out_dir, "spot_level_metrics_svg_top100_overlap.csv"),
+            index=False,
+        )
+
+    # Optional single-gene map output
+    if args.gene is not None:
+        if args.gene not in common_genes:
+            raise ValueError(
+                f"--gene {args.gene} not found in common genes. "
+                f"Example available gene: {common_genes[0] if common_genes else 'None'}"
+            )
+        gj = common_genes.index(args.gene)
+        pred_g = pred_eval[:, gj]
+        true_g = true_eval[:, gj]
+        mask = np.isfinite(pred_g) & np.isfinite(true_g)
+        pred_g = pred_g[mask]
+        true_g = true_g[mask]
+        coords_g = spot_coords_full[mask]
+        pcc_g, emd_g = calc_pcc_emd(pred_g, true_g)
+
+        if args.color_mode == "quantile_match":
+            pred_plot = quantile_match(pred_g, true_g)
+            vmin = float(np.percentile(true_g, args.vmin_pct))
+            vmax = float(np.percentile(true_g, args.vmax_pct))
+            pred_clip = np.clip(pred_plot, vmin, vmax)
+            true_clip = np.clip(true_g, vmin, vmax)
+        elif args.color_mode == "true_range":
+            vmin = float(np.percentile(true_g, args.vmin_pct))
+            vmax = float(np.percentile(true_g, args.vmax_pct))
+            pred_clip = np.clip(pred_g, vmin, vmax)
+            true_clip = np.clip(true_g, vmin, vmax)
+        else:
+            pred_clip, true_clip, vmin, vmax = normalize_pair(
+                pred_g, true_g, vmin_pct=args.vmin_pct, vmax_pct=args.vmax_pct
+            )
+
+        fig, axes = plt.subplots(1, 2, figsize=(15.5, 5.4))
+        fig.subplots_adjust(left=0.04, right=0.84, top=0.88, bottom=0.08, wspace=0.10)
+
+        plot_spots(
+            coords_g,
+            pred_clip,
+            vmin,
+            vmax,
+            args.cmap,
+            args.spot_size_scale,
+            axes[0],
+            f"{args.gene}_pred",
+        )
+        plot_spots(
+            coords_g,
+            true_clip,
+            vmin,
+            vmax,
+            args.cmap,
+            args.spot_size_scale,
+            axes[1],
+            f"{args.gene}_true",
+        )
+
+        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+        sm = plt.cm.ScalarMappable(norm=norm, cmap=args.cmap)
+        sm.set_array([])
+        cax = fig.add_axes([0.89, 0.22, 0.018, 0.52])
+        cbar = fig.colorbar(sm, cax=cax)
+        cbar.ax.tick_params(labelsize=9)
+
+        fig.suptitle(f"{args.gene} | PCC: {pcc_g:.3f}, EMD: {emd_g:.3f}", fontsize=13)
+        out_png = os.path.join(args.out_dir, f"{args.gene}_pred_vs_true_spatial.png")
+        plt.savefig(out_png, dpi=600, bbox_inches="tight")
+        plt.close(fig)
+
+        with open(
+            os.path.join(args.out_dir, f"{args.gene}_spot_level_metrics.txt"),
+            "w",
+            encoding="utf-8",
+        ) as f:
+            f.write(f"gene={args.gene}\n")
+            f.write(f"pcc={pcc_g:.6f}\n")
+            f.write(f"emd={emd_g:.6f}\n")
+
+    # Optional SEQUOIA comparison if provided as spot-by-gene csv
+    if args.sequoia_pred_csv:
+        seq_df = pd.read_csv(args.sequoia_pred_csv, index_col=0)
+        common_spots = [s for s in adata.obs_names if s in seq_df.index]
+        seq_common_genes = [g for g in common_genes if g in seq_df.columns]
+        if common_spots and seq_common_genes:
+            pred_seq = seq_df.loc[common_spots, seq_common_genes].to_numpy(float)
+            true_seq = pd.DataFrame(
+                true_mat, index=adata.obs_names, columns=st_gene_names
+            ).loc[common_spots, seq_common_genes].to_numpy(float)
+            if args.smooth_pred:
+                coords_seq = pd.DataFrame(spot_coords_full, index=adata.obs_names).loc[
+                    common_spots
+                ].to_numpy(float)
+                for j in range(pred_seq.shape[1]):
+                    pred_seq[:, j] = smooth_expression_by_neighbors(
+                        coords_seq, pred_seq[:, j], k=args.smooth_k, sigma=args.smooth_sigma
+                    )
+            if args.smooth_st:
+                coords_seq = pd.DataFrame(spot_coords_full, index=adata.obs_names).loc[
+                    common_spots
+                ].to_numpy(float)
+                for j in range(true_seq.shape[1]):
+                    true_seq[:, j] = smooth_expression_by_neighbors(
+                        coords_seq, true_seq[:, j], k=args.smooth_k, sigma=args.smooth_sigma
+                    )
+            rows = []
+            for j, g in enumerate(seq_common_genes):
+                pcc, emd = calc_pcc_emd(pred_seq[:, j], true_seq[:, j])
+                rows.append({"gene": g, "pcc": pcc, "emd": emd})
+            pd.DataFrame(rows).to_csv(
+                os.path.join(args.out_dir, "sequoia_spot_level_metrics_all_common_genes.csv"),
+                index=False,
+            )
 
     summary = {
-        "n_common_genes": int(len(common_genes)),
-        "pcc_mean": float(np.nanmean(metrics_df["pcc"])),
-        "pcc_median": float(np.nanmedian(metrics_df["pcc"])),
-        "emd_mean": float(np.nanmean(metrics_df["emd"])),
-        "emd_median": float(np.nanmedian(metrics_df["emd"])),
-        "mse_mean": float(np.nanmean(metrics_df["mse"])),
-        "mse_median": float(np.nanmedian(metrics_df["mse"])),
+        "n_spots": int(spot_coords_full.shape[0]),
+        "n_input_patches": int(feats.shape[0]),
+        "n_center_patches_predicted": int(center_preds.shape[0]),
+        "n_pred_genes": int(len(gene_names)),
+        "n_common_genes_with_st": int(len(common_genes)),
+        "window_size": int(args.window_size),
+        "stride": 1,
+        "k_neigh": int(args.k_neigh),
+        "weight_mode": args.weight_mode,
+        "smooth_st": bool(args.smooth_st),
+        "smooth_pred": bool(args.smooth_pred),
+        "smooth_k": int(args.smooth_k),
+        "smooth_sigma": float(args.smooth_sigma),
         "spot_to_nearest_center_dist_px_median": float(np.median(nn_d0)),
         "spot_to_nearest_center_dist_px_p95": float(np.percentile(nn_d0, 95)),
         "spot_to_nearest_center_dist_px_max": float(np.max(nn_d0)),
     }
-
-    summary_path = os.path.join(args.out_dir, "spot_level_metrics_summary.json")
-    with open(summary_path, "w", encoding="utf-8") as f:
+    with open(os.path.join(args.out_dir, "run_summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    print(f"[DONE] Wrote metrics: {metrics_path}")
-    print(f"[DONE] Wrote summary: {summary_path}")
+    print("[DONE] Outputs written to:", args.out_dir)
+    print("[DONE] Common genes evaluated:", len(common_genes))
 
 
 if __name__ == "__main__":
